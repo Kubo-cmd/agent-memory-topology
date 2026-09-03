@@ -3,14 +3,47 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+from typing import Any, cast
+
 import numpy as np
 import pytest
 
 from agent_memory_topology import (
+    MemoryRelationship,
     MemoryTopologyAnalyzer,
+    ProvenanceRecord,
+    TemporalRelationshipGraph,
     TopologicalFeature,
     TopologyResult,
 )
+
+UTC = timezone.utc
+
+
+def at(day: int) -> datetime:
+    """Build stable timezone-aware timestamps for temporal tests."""
+    return datetime(2026, 1, day, tzinfo=UTC)
+
+
+def provenance() -> ProvenanceRecord:
+    """Build a minimal evidence record."""
+    return ProvenanceRecord("event-stream", "event", at(2), evidence_id="evt-7")
+
+
+def relationship(**overrides: object) -> MemoryRelationship:
+    """Build a valid relationship with selectively overridden fields."""
+    values = {
+        "subject_id": "memory-a",
+        "predicate": "supports",
+        "object_id": "memory-b",
+        "valid_from": at(1),
+        "valid_until": at(5),
+        "recorded_at": at(2),
+        "provenance": (provenance(),),
+    }
+    values.update(overrides)
+    return MemoryRelationship(**values)
 
 
 # ---------------------------------------------------------------------------
@@ -32,13 +65,15 @@ def cluster_data() -> np.ndarray:
 def loop_data() -> np.ndarray:
     """Points on a circle (topological loop)."""
     theta = np.linspace(0, 2 * np.pi, 50, endpoint=False)
-    return np.column_stack([
-        np.cos(theta) * 3,
-        np.sin(theta) * 3,
-        np.zeros(50),
-        np.zeros(50),
-        np.zeros(50),
-    ])
+    return np.column_stack(
+        [
+            np.cos(theta) * 3,
+            np.sin(theta) * 3,
+            np.zeros(50),
+            np.zeros(50),
+            np.zeros(50),
+        ]
+    )
 
 
 @pytest.fixture
@@ -57,8 +92,11 @@ class TestTopologicalFeature:
 
     def test_valid_feature(self) -> None:
         feat = TopologicalFeature(
-            dimension=0, birth=0.0, death=1.0,
-            persistence=1.0, indices=[0, 1],
+            dimension=0,
+            birth=0.0,
+            death=1.0,
+            persistence=1.0,
+            indices=[0, 1],
         )
         assert feat.dimension == 0
         assert feat.persistence == 1.0
@@ -66,15 +104,21 @@ class TestTopologicalFeature:
     def test_negative_persistence_raises(self) -> None:
         with pytest.raises(ValueError, match="negative"):
             TopologicalFeature(
-                dimension=0, birth=1.0, death=0.5,
-                persistence=-0.5, indices=[0],
+                dimension=0,
+                birth=1.0,
+                death=0.5,
+                persistence=-0.5,
+                indices=[0],
             )
 
     def test_death_before_birth_raises(self) -> None:
         with pytest.raises(ValueError, match="Death"):
             TopologicalFeature(
-                dimension=0, birth=2.0, death=1.0,
-                persistence=1.0, indices=[0],
+                dimension=0,
+                birth=2.0,
+                death=1.0,
+                persistence=1.0,
+                indices=[0],
             )
 
 
@@ -92,14 +136,132 @@ class TestTopologyResult:
             n_features={0: 3, 1: 1, 2: 0},
             significant_features=[
                 TopologicalFeature(
-                    dimension=0, birth=0.0, death=2.0,
-                    persistence=2.0, indices=[0, 1],
+                    dimension=0,
+                    birth=0.0,
+                    death=2.0,
+                    persistence=2.0,
+                    indices=[0, 1],
                 ),
             ],
         )
         summary = result.summary()
         assert "H0" in summary
         assert "H1" in summary
+
+
+class TestSemanticProvenance:
+    """Test provenance and bitemporal graph relationships."""
+
+    def test_provenance_requires_semantic_source(self) -> None:
+        with pytest.raises(ValueError, match="source_id"):
+            ProvenanceRecord(" ", "event", at(1))
+
+    def test_provenance_requires_timezone(self) -> None:
+        with pytest.raises(ValueError, match="timezone"):
+            ProvenanceRecord("source", "event", datetime(2026, 1, 1))
+
+    def test_provenance_attributes_are_immutable(self) -> None:
+        attributes = {"channel": "sensor", "tags": ["original"]}
+        record = ProvenanceRecord("source", "event", at(1), attributes=attributes)
+        attributes["channel"] = "changed"
+        cast(list[str], attributes["tags"]).append("changed")
+        assert record.attributes["channel"] == "sensor"
+        assert record.attributes["tags"] == ("original",)
+        with pytest.raises(TypeError):
+            cast(dict[str, str], record.attributes)["channel"] = "changed"
+
+    def test_relationship_requires_provenance(self) -> None:
+        with pytest.raises(ValueError, match="provenance"):
+            relationship(provenance=())
+
+    def test_relationship_rejects_invalid_provenance_entry(self) -> None:
+        with pytest.raises(TypeError, match="ProvenanceRecord"):
+            relationship(provenance=("not-evidence",))
+
+    def test_relationship_valid_interval_is_half_open(self) -> None:
+        edge = relationship()
+        assert edge.is_valid_at(at(1), at(3))
+        assert edge.is_valid_at(at(4), at(3))
+        assert not edge.is_valid_at(at(5), at(3))
+
+    def test_relationship_respects_knowledge_time(self) -> None:
+        edge = relationship(recorded_at=at(3))
+        assert not edge.is_valid_at(at(4), at(2))
+        assert edge.is_valid_at(at(4), at(3))
+
+    def test_relationship_always_validates_query_timezones(self) -> None:
+        with pytest.raises(ValueError, match="known_at"):
+            relationship().is_valid_at(at(6), datetime(2026, 1, 2))
+
+    def test_retraction_preserves_historical_query(self) -> None:
+        edge = relationship(retracted_at=at(4))
+        assert edge.is_valid_at(at(3), at(3))
+        assert not edge.is_valid_at(at(3), at(4))
+        assert not edge.is_valid_at(at(3))
+
+    def test_graph_retracts_active_relationship_without_losing_history(self) -> None:
+        edge = relationship(valid_until=None)
+        graph = TemporalRelationshipGraph([edge])
+        retracted = graph.retract(edge, at(4))
+        assert graph.relationships_at(at(3), at(3)) == [retracted]
+        assert graph.relationships_at(at(3), at(4)) == []
+        assert graph.relationships_at(at(3)) == []
+
+    def test_graph_rejects_retracting_unknown_relationship(self) -> None:
+        with pytest.raises(ValueError, match="not present"):
+            TemporalRelationshipGraph().retract(relationship(), at(4))
+
+    @pytest.mark.parametrize(
+        ("field_name", "value"),
+        [
+            ("valid_until", at(1)),
+            ("retracted_at", at(2)),
+        ],
+    )
+    def test_relationship_rejects_empty_intervals(
+        self,
+        field_name: str,
+        value: datetime,
+    ) -> None:
+        with pytest.raises(ValueError, match="later"):
+            relationship(**{field_name: value})
+
+    def test_graph_filters_by_predicate_and_time(self) -> None:
+        graph = TemporalRelationshipGraph(
+            [
+                relationship(),
+                relationship(predicate="contradicts", valid_from=at(5), valid_until=None),
+            ]
+        )
+        assert len(graph.relationships_at(at(3), at(3), predicate="supports")) == 1
+        assert graph.relationships_at(at(3), at(3), predicate="contradicts") == []
+
+    def test_empty_graph_still_validates_query_timezones(self) -> None:
+        with pytest.raises(ValueError, match="valid_at"):
+            TemporalRelationshipGraph().relationships_at(datetime(2026, 1, 1))
+
+    def test_graph_neighbors_are_directional_and_deterministic(self) -> None:
+        graph = TemporalRelationshipGraph(
+            [
+                relationship(subject_id="memory-a", object_id="memory-c"),
+                relationship(subject_id="memory-a", object_id="memory-b"),
+                relationship(subject_id="memory-d", object_id="memory-a"),
+            ]
+        )
+        assert graph.neighbors("memory-a", at(3), at(3), "outgoing") == [
+            "memory-b",
+            "memory-c",
+        ]
+        assert graph.neighbors("memory-a", at(3), at(3), "incoming") == ["memory-d"]
+
+    def test_graph_rejects_unknown_direction(self) -> None:
+        graph = TemporalRelationshipGraph([relationship()])
+        with pytest.raises(ValueError, match="direction"):
+            graph.neighbors("memory-a", at(3), direction="sideways")
+
+    def test_graph_constructor_validates_relationships(self) -> None:
+        with pytest.raises(TypeError, match="MemoryRelationship"):
+            TemporalRelationshipGraph(cast(Any, ["not-an-edge"]))
 
 
 # ---------------------------------------------------------------------------
@@ -218,7 +380,9 @@ class TestCompress:
         analyzer = MemoryTopologyAnalyzer()
         for strategy in ("topological", "diversity", "hybrid"):
             compressed, indices = analyzer.compress(
-                mixed_data, keep_ratio=0.3, strategy=strategy,
+                mixed_data,
+                keep_ratio=0.3,
+                strategy=strategy,
             )
             assert len(compressed) > 0
             assert len(indices) > 0
@@ -243,7 +407,9 @@ class TestCompare:
         assert distance == pytest.approx(0.0, abs=0.01)
 
     def test_different_topologies(
-        self, cluster_data: np.ndarray, loop_data: np.ndarray,
+        self,
+        cluster_data: np.ndarray,
+        loop_data: np.ndarray,
     ) -> None:
         analyzer = MemoryTopologyAnalyzer()
         distance = analyzer.compare(cluster_data, loop_data)
@@ -290,7 +456,9 @@ class TestConstructor:
 
     def test_custom_params(self) -> None:
         analyzer = MemoryTopologyAnalyzer(
-            max_dimension=1, persistence_threshold=0.5, metric="cosine",
+            max_dimension=1,
+            persistence_threshold=0.5,
+            metric="cosine",
         )
         assert analyzer.max_dimension == 1
         assert analyzer.persistence_threshold == 0.5
