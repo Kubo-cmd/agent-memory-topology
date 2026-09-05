@@ -788,8 +788,11 @@ def main() -> None:
         # Detect specific features
         loops = analyzer.detect_reasoning_loops(embeddings)
         print(f"Detected {len(loops)} reasoning loops")
-        for i, loop in enumerate(loops[:3], 1):
-            print(f"  {i}. persistence={loop.persistence:.3f}, indices={loop.indices}")
+        for i, reasoning_loop in enumerate(loops[:3], 1):
+            print(
+                f"  {i}. persistence={reasoning_loop.persistence:.3f}, "
+                f"indices={reasoning_loop.indices}"
+            )
         print()
 
         gaps = analyzer.detect_knowledge_gaps(embeddings)
