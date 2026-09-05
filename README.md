@@ -1,6 +1,46 @@
 # Agent Memory Topology
 
-Semantic memory compression via persistent homology — applying algebraic topology to detect structural features in agent memory embeddings.
+Persistent homology plus provenance-backed, bitemporal relationships for agent memory.
+
+## Semantic provenance and temporal validity
+
+Memory-graph edges use RDF-like `subject_id`, `predicate`, and `object_id`
+semantics. Every edge must cite at least one `ProvenanceRecord`. Two half-open
+time intervals preserve both kinds of truth:
+
+- `valid_from` / `valid_until`: when the relationship is true in the world.
+- `recorded_at` / `retracted_at`: when the memory system knew the claim.
+
+All timestamps must include a timezone. This prevents local-time ambiguity and
+allows historical queries without treating retracted claims as currently true.
+
+```python
+from datetime import datetime, timezone
+from agent_memory_topology import (
+    MemoryRelationship,
+    ProvenanceRecord,
+    TemporalRelationshipGraph,
+)
+
+observed = datetime(2026, 1, 2, tzinfo=timezone.utc)
+evidence = ProvenanceRecord("event-7", "event", observed)
+edge = MemoryRelationship(
+    subject_id="memory-a",
+    predicate="supports",
+    object_id="memory-b",
+    valid_from=observed,
+    recorded_at=observed,
+    provenance=(evidence,),
+)
+graph = TemporalRelationshipGraph([edge])
+active_edges = graph.relationships_at(observed, known_at=observed)
+retracted = graph.retract(
+    edge,
+    datetime(2026, 1, 3, tzinfo=timezone.utc),
+)
+historical_edges = graph.relationships_at(observed, known_at=observed)
+current_edges = graph.relationships_at(observed)  # Empty after retraction.
+```
 
 ## The Problem
 
@@ -19,7 +59,7 @@ By preserving topological features rather than individual memories, we achieve c
 ## Installation
 
 ```bash
-pip install ripser scikit-tda persim numpy scipy
+python -m pip install .
 ```
 
 ## Quick Start
@@ -245,9 +285,11 @@ For larger memory sets, use landmark subsampling or approximate methods.
 
 ```bash
 pytest tests/ -v
+python -m build
+python -m twine check dist/*
 ```
 
-All 29 tests pass, covering:
+The regression suite covers:
 - Data structure validation
 - Input validation (empty, NaN, Inf, dimension checks)
 - Topological analysis (clusters, loops, mixed data)
@@ -255,6 +297,9 @@ All 29 tests pass, covering:
 - Topology comparison
 - Feature detection
 - Constructor validation
+- Semantic provenance validation
+- World-time and knowledge-time relationship queries
+- Retraction history and deterministic graph traversal
 
 ## Performance
 

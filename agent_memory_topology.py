@@ -6,8 +6,7 @@ Uses topological data analysis (TDA) to detect structural features in agent
 memory embeddings: clusters (H0), reasoning loops (H1), knowledge gaps (H2).
 Compresses memory by preserving topology, not just similarity.
 
-This is genuinely alien math — algebraic topology applied to agent memory.
-No one has built this before.
+Uses algebraic topology to model structural patterns in agent memory.
 
 Theory:
 - Memory embeddings form a point cloud in high-dimensional space
@@ -28,29 +27,211 @@ Usage:
 
 from __future__ import annotations
 
-import json
 import warnings
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass, field, replace
+from datetime import datetime
+from types import MappingProxyType
+from typing import Any
 
 import numpy as np
 from ripser import ripser
-from persim import plot_diagrams
-
 
 # ---------------------------------------------------------------------------
 # Data structures
 # ---------------------------------------------------------------------------
 
 
+def _require_aware(value: datetime, field_name: str) -> None:
+    """Reject ambiguous naive timestamps at the public API boundary."""
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError(f"{field_name} must include a timezone")
+
+
+def _freeze_value(value: Any) -> Any:
+    """Recursively detach and freeze common attribute containers."""
+    if isinstance(value, Mapping):
+        return MappingProxyType({key: _freeze_value(item) for key, item in value.items()})
+    if isinstance(value, (list, tuple)):
+        return tuple(_freeze_value(item) for item in value)
+    if isinstance(value, (set, frozenset)):
+        return frozenset(_freeze_value(item) for item in value)
+    return value
+
+
+def _freeze_attributes(attributes: Mapping[str, Any]) -> Mapping[str, Any]:
+    """Return an immutable copy of an attribute mapping."""
+    return MappingProxyType({key: _freeze_value(value) for key, value in attributes.items()})
+
+
+@dataclass(frozen=True)
+class ProvenanceRecord:
+    """Evidence describing where and when a relationship was observed."""
+
+    source_id: str
+    source_type: str
+    observed_at: datetime
+    evidence_id: str = ""
+    attributes: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if not self.source_id.strip():
+            raise ValueError("source_id cannot be empty")
+        if not self.source_type.strip():
+            raise ValueError("source_type cannot be empty")
+        _require_aware(self.observed_at, "observed_at")
+        object.__setattr__(self, "attributes", _freeze_attributes(self.attributes))
+
+
+@dataclass(frozen=True)
+class MemoryRelationship:
+    """A provenance-backed, bitemporal edge in a semantic memory graph.
+
+    ``valid_from``/``valid_until`` describe when the claim is true in the
+    represented world. ``recorded_at``/``retracted_at`` describe when the
+    memory system knew the claim. Both intervals are half-open.
+    """
+
+    subject_id: str
+    predicate: str
+    object_id: str
+    valid_from: datetime
+    recorded_at: datetime
+    valid_until: datetime | None = None
+    retracted_at: datetime | None = None
+    confidence: float = 1.0
+    provenance: tuple[ProvenanceRecord, ...] = field(default_factory=tuple)
+    attributes: Mapping[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        for value, field_name in (
+            (self.subject_id, "subject_id"),
+            (self.predicate, "predicate"),
+            (self.object_id, "object_id"),
+        ):
+            if not value.strip():
+                raise ValueError(f"{field_name} cannot be empty")
+        if not 0.0 <= self.confidence <= 1.0:
+            raise ValueError("confidence must be in [0, 1]")
+        if not self.provenance:
+            raise ValueError("provenance must contain at least one record")
+        if not all(isinstance(item, ProvenanceRecord) for item in self.provenance):
+            raise TypeError("provenance entries must be ProvenanceRecord instances")
+
+        _require_aware(self.valid_from, "valid_from")
+        _require_aware(self.recorded_at, "recorded_at")
+        if self.valid_until is not None:
+            _require_aware(self.valid_until, "valid_until")
+            if self.valid_until <= self.valid_from:
+                raise ValueError("valid_until must be later than valid_from")
+        if self.retracted_at is not None:
+            _require_aware(self.retracted_at, "retracted_at")
+            if self.retracted_at <= self.recorded_at:
+                raise ValueError("retracted_at must be later than recorded_at")
+
+        object.__setattr__(self, "provenance", tuple(self.provenance))
+        object.__setattr__(self, "attributes", _freeze_attributes(self.attributes))
+
+    def is_valid_at(
+        self,
+        valid_at: datetime,
+        known_at: datetime | None = None,
+    ) -> bool:
+        """Return whether this edge is valid, optionally as known at a time."""
+        _require_aware(valid_at, "valid_at")
+        if known_at is not None:
+            _require_aware(known_at, "known_at")
+        if not (
+            self.valid_from <= valid_at
+            and (self.valid_until is None or valid_at < self.valid_until)
+        ):
+            return False
+        if known_at is None:
+            return self.retracted_at is None
+
+        return self.recorded_at <= known_at and (
+            self.retracted_at is None or known_at < self.retracted_at
+        )
+
+
+class TemporalRelationshipGraph:
+    """Query semantic memory edges without discarding historical truth."""
+
+    def __init__(self, relationships: Iterable[MemoryRelationship] = ()) -> None:
+        self._relationships: list[MemoryRelationship] = []
+        for relationship in relationships:
+            self.add(relationship)
+
+    def add(self, relationship: MemoryRelationship) -> None:
+        """Add a validated relationship to the graph."""
+        if not isinstance(relationship, MemoryRelationship):
+            raise TypeError("relationship must be a MemoryRelationship")
+        self._relationships.append(relationship)
+
+    def retract(
+        self,
+        relationship: MemoryRelationship,
+        retracted_at: datetime,
+    ) -> MemoryRelationship:
+        """Retract an edge while retaining its earlier knowledge-time history."""
+        if not isinstance(relationship, MemoryRelationship):
+            raise TypeError("relationship must be a MemoryRelationship")
+        _require_aware(retracted_at, "retracted_at")
+        for index, candidate in enumerate(self._relationships):
+            if candidate is relationship:
+                if candidate.retracted_at is not None:
+                    raise ValueError("relationship is already retracted")
+                retracted = replace(candidate, retracted_at=retracted_at)
+                self._relationships[index] = retracted
+                return retracted
+        raise ValueError("relationship is not present in this graph")
+
+    def relationships_at(
+        self,
+        valid_at: datetime,
+        known_at: datetime | None = None,
+        predicate: str | None = None,
+    ) -> list[MemoryRelationship]:
+        """Return edges valid at a world time and optional knowledge time."""
+        _require_aware(valid_at, "valid_at")
+        if known_at is not None:
+            _require_aware(known_at, "known_at")
+        return [
+            relationship
+            for relationship in self._relationships
+            if (predicate is None or relationship.predicate == predicate)
+            and relationship.is_valid_at(valid_at, known_at)
+        ]
+
+    def neighbors(
+        self,
+        memory_id: str,
+        valid_at: datetime,
+        known_at: datetime | None = None,
+        direction: str = "both",
+    ) -> list[str]:
+        """Return deterministic neighboring IDs for a temporal graph slice."""
+        if direction not in {"incoming", "outgoing", "both"}:
+            raise ValueError("direction must be incoming, outgoing, or both")
+
+        neighbors = set()
+        for relationship in self.relationships_at(valid_at, known_at):
+            if direction in {"outgoing", "both"} and relationship.subject_id == memory_id:
+                neighbors.add(relationship.object_id)
+            if direction in {"incoming", "both"} and relationship.object_id == memory_id:
+                neighbors.add(relationship.subject_id)
+        return sorted(neighbors)
+
+
 @dataclass
 class TopologicalFeature:
     """A detected topological feature in memory space."""
+
     dimension: int  # 0=cluster, 1=loop, 2=void
     birth: float  # Scale at which feature appears
     death: float  # Scale at which feature disappears
     persistence: float  # death - birth (significance)
-    indices: List[int]  # Memory indices involved
+    indices: list[int]  # Memory indices involved
     label: str = ""  # Optional semantic label
 
     def __post_init__(self) -> None:
@@ -63,12 +244,13 @@ class TopologicalFeature:
 @dataclass
 class TopologyResult:
     """Result of topological analysis on memory embeddings."""
+
     n_memories: int
-    n_features: Dict[int, int] = field(default_factory=dict)  # dim -> count
-    significant_features: List[TopologicalFeature] = field(default_factory=list)
-    persistence_diagrams: Dict[int, np.ndarray] = field(default_factory=dict)
-    bottleneck_distance: Optional[float] = None  # Comparison metric
-    metadata: Dict[str, Any] = field(default_factory=dict)
+    n_features: dict[int, int] = field(default_factory=dict)  # dim -> count
+    significant_features: list[TopologicalFeature] = field(default_factory=list)
+    persistence_diagrams: dict[int, np.ndarray] = field(default_factory=dict)
+    bottleneck_distance: float | None = None  # Comparison metric
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     def summary(self) -> str:
         """Human-readable summary of topological features."""
@@ -90,7 +272,9 @@ class TopologyResult:
                 reverse=True,
             )[:5]
             for i, feat in enumerate(sorted_features, 1):
-                dim_name = {0: "cluster", 1: "loop", 2: "void"}.get(feat.dimension, f"H{feat.dimension}")
+                dim_name = {0: "cluster", 1: "loop", 2: "void"}.get(
+                    feat.dimension, f"H{feat.dimension}"
+                )
                 lines.append(
                     f"  {i}. {dim_name} (persistence={feat.persistence:.3f}, "
                     f"birth={feat.birth:.3f}, death={feat.death:.3f})"
@@ -143,7 +327,7 @@ class MemoryTopologyAnalyzer:
     def analyze(
         self,
         embeddings: np.ndarray,
-        labels: Optional[List[str]] = None,
+        labels: list[str] | None = None,
     ) -> TopologyResult:
         """Analyze topological structure of memory embeddings.
 
@@ -165,6 +349,7 @@ class MemoryTopologyAnalyzer:
                 f"Only {n_memories} memories — topological analysis requires >= 3 points. "
                 f"Returning empty result.",
                 UserWarning,
+                stacklevel=2,
             )
             return TopologyResult(
                 n_memories=n_memories,
@@ -186,11 +371,12 @@ class MemoryTopologyAnalyzer:
         diagrams = result["dgms"]
 
         # Extract features
-        all_features: List[TopologicalFeature] = []
-        n_features: Dict[int, int] = {}
+        all_features: list[TopologicalFeature] = []
+        n_features: dict[int, int] = {}
 
         # Build pairwise distance matrix for index mapping
         from scipy.spatial.distance import pdist, squareform
+
         dist_matrix = squareform(pdist(embeddings, metric=self.metric))
 
         for dim in range(self.max_dimension + 1):
@@ -212,12 +398,16 @@ class MemoryTopologyAnalyzer:
             # H0: find the point closest to the cluster center
             # H1: find points on the loop (highest local density on cycle)
             # H2: find points bordering the void
-            for i, (birth, death) in enumerate(finite_diagram):
+            for _i, (birth, death) in enumerate(finite_diagram):
                 persistence = death - birth
                 if persistence >= self.persistence_threshold:
                     # Find representative indices for this feature
                     representative_indices = self._find_representative_indices(
-                        dim, birth, death, dist_matrix, embeddings,
+                        dim,
+                        birth,
+                        death,
+                        dist_matrix,
+                        embeddings,
                     )
                     feature = TopologicalFeature(
                         dimension=dim,
@@ -225,7 +415,11 @@ class MemoryTopologyAnalyzer:
                         death=float(death),
                         persistence=float(persistence),
                         indices=representative_indices,
-                        label=labels[representative_indices[0]] if labels and representative_indices[0] < len(labels) else "",
+                        label=(
+                            labels[representative_indices[0]]
+                            if labels and representative_indices[0] < len(labels)
+                            else ""
+                        ),
                     )
                     all_features.append(feature)
 
@@ -241,7 +435,7 @@ class MemoryTopologyAnalyzer:
         embeddings: np.ndarray,
         keep_ratio: float = 0.3,
         strategy: str = "topological",
-    ) -> Tuple[np.ndarray, List[int]]:
+    ) -> tuple[np.ndarray, list[int]]:
         """Compress memory by preserving topological structure.
 
         Args:
@@ -342,7 +536,7 @@ class MemoryTopologyAnalyzer:
         self,
         embeddings: np.ndarray,
         min_persistence: float = 0.2,
-    ) -> List[TopologicalFeature]:
+    ) -> list[TopologicalFeature]:
         """Detect reasoning loops (H1 features) in memory.
 
         Args:
@@ -354,7 +548,8 @@ class MemoryTopologyAnalyzer:
         """
         result = self.analyze(embeddings)
         return [
-            f for f in result.significant_features
+            f
+            for f in result.significant_features
             if f.dimension == 1 and f.persistence >= min_persistence
         ]
 
@@ -362,7 +557,7 @@ class MemoryTopologyAnalyzer:
         self,
         embeddings: np.ndarray,
         min_persistence: float = 0.3,
-    ) -> List[TopologicalFeature]:
+    ) -> list[TopologicalFeature]:
         """Detect knowledge gaps (H2 features) in memory.
 
         Args:
@@ -374,7 +569,8 @@ class MemoryTopologyAnalyzer:
         """
         result = self.analyze(embeddings)
         return [
-            f for f in result.significant_features
+            f
+            for f in result.significant_features
             if f.dimension == 2 and f.persistence >= min_persistence
         ]
 
@@ -408,7 +604,7 @@ class MemoryTopologyAnalyzer:
         death: float,
         dist_matrix: np.ndarray,
         embeddings: np.ndarray,
-    ) -> List[int]:
+    ) -> list[int]:
         """Find memory indices most representative of a topological feature.
 
         Args:
@@ -460,8 +656,7 @@ class MemoryTopologyAnalyzer:
             candidates = []
             for i in range(n_points):
                 neighbors_outside = sum(
-                    1 for j in range(n_points)
-                    if i != j and dist_matrix[i, j] > birth
+                    1 for j in range(n_points) if i != j and dist_matrix[i, j] > birth
                 )
                 # Points bordering void have many distant neighbors
                 if neighbors_outside > n_points * 0.3:
@@ -477,14 +672,14 @@ class MemoryTopologyAnalyzer:
         self,
         result: TopologyResult,
         n_keep: int,
-    ) -> List[int]:
+    ) -> list[int]:
         """Keep memories with highest topological significance."""
         if not result.significant_features:
             # No significant features — keep first n_keep
             return list(range(n_keep))
 
         # Score each memory by its involvement in significant features
-        scores: Dict[int, float] = {}
+        scores: dict[int, float] = {}
         for feature in result.significant_features:
             for idx in feature.indices:
                 scores[idx] = scores.get(idx, 0.0) + feature.persistence
@@ -497,7 +692,7 @@ class MemoryTopologyAnalyzer:
         self,
         result: TopologyResult,
         n_keep: int,
-    ) -> List[int]:
+    ) -> list[int]:
         """Keep one memory from each topological cluster (H0)."""
         if len(result.persistence_diagrams) == 0 or len(result.persistence_diagrams[0]) == 0:
             return list(range(n_keep))
@@ -513,7 +708,7 @@ class MemoryTopologyAnalyzer:
         # Keep memories that are spread across the persistence diagram
         sorted_by_birth = np.argsort(h0_diagram[:, 0])
         step = max(1, len(sorted_by_birth) // n_keep)
-        return sorted_by_birth[::step][:n_keep].tolist()
+        return [int(index) for index in sorted_by_birth[::step][:n_keep]]
 
 
 # ---------------------------------------------------------------------------
@@ -565,17 +760,20 @@ def main() -> None:
 
         # Loop: reasoning cycle
         theta = np.linspace(0, 2 * np.pi, 40, endpoint=False)
-        loop = np.column_stack([
-            np.cos(theta) * 3,
-            np.sin(theta) * 3,
-            np.zeros(40),
-        ] + [np.zeros(40)] * 7)
+        loop = np.column_stack(
+            [
+                np.cos(theta) * 3,
+                np.sin(theta) * 3,
+                np.zeros(40),
+            ]
+            + [np.zeros(40)] * 7
+        )
 
         embeddings = np.vstack([cluster1, cluster2, cluster3, loop])
 
         print(f"Generated {len(embeddings)} synthetic memories")
         print(f"  - 3 conceptual clusters ({n_per_cluster} memories each)")
-        print(f"  - 1 reasoning loop (40 memories)")
+        print("  - 1 reasoning loop (40 memories)")
         print()
 
         # Analyze
@@ -590,8 +788,11 @@ def main() -> None:
         # Detect specific features
         loops = analyzer.detect_reasoning_loops(embeddings)
         print(f"Detected {len(loops)} reasoning loops")
-        for i, loop in enumerate(loops[:3], 1):
-            print(f"  {i}. persistence={loop.persistence:.3f}, indices={loop.indices}")
+        for i, reasoning_loop in enumerate(loops[:3], 1):
+            print(
+                f"  {i}. persistence={reasoning_loop.persistence:.3f}, "
+                f"indices={reasoning_loop.indices}"
+            )
         print()
 
         gaps = analyzer.detect_knowledge_gaps(embeddings)

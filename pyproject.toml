@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "agent-memory-topology"
-version = "0.1.0"
-description = "Semantic memory compression via persistent homology for AI agents"
+version = "0.2.0"
+description = "Topology, semantic provenance, and temporal relationships for agent memory"
 readme = "README.md"
 license = {text = "MIT"}
 authors = [
@@ -42,20 +42,22 @@ dependencies = [
     "numpy>=1.21.0",
     "scipy>=1.7.0",
     "ripser>=0.6.0",
-    "scikit-tda>=1.0.0",
-    "persim>=0.3.0",
 ]
 
 [project.optional-dependencies]
 dev = [
+    "build>=1.2.0",
     "pytest>=7.0.0",
     "pytest-cov>=4.0.0",
     "black>=22.0.0",
     "ruff>=0.1.0",
-    "mypy>=1.0.0",
+    "mypy>=1.0.0,<1.19",
+    "numpy<2.5",
+    "twine>=5.0.0",
 ]
 viz = [
     "matplotlib>=3.5.0",
+    "persim>=0.3.0",
     "plotly>=5.0.0",
 ]
 
@@ -67,13 +69,12 @@ Issues = "https://github.com/Kubo-cmd/agent-memory-topology/issues"
 [project.scripts]
 amt-demo = "agent_memory_topology:main"
 
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["agent_memory_topology*"]
+[tool.setuptools]
+py-modules = ["agent_memory_topology"]
 
 [tool.black]
 line-length = 100
-target-version = ['py39', 'py310', 'py311', 'py312']
+target-version = ['py39']
 
 [tool.ruff]
 line-length = 100
@@ -88,6 +89,10 @@ python_version = "3.9"
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = false
+
+[[tool.mypy.overrides]]
+module = ["ripser", "scipy.*"]
+ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
